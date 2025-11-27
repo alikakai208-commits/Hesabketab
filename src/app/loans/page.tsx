@@ -1,4 +1,3 @@
-
 'use client';
 
 import React, { useCallback, useState } from 'react';
@@ -120,7 +119,7 @@ export default function LoansPage() {
             });
         }
     }
-}, [user, firestore, editingLoan, toast, payees]);
+}, [user, firestore, editingLoan, toast]);
 
 
   const handlePayInstallment = useCallback(async ({ loan, paymentBankAccountId, installmentAmount }: { loan: Loan, paymentBankAccountId: string, installmentAmount: number }) => {
@@ -260,15 +259,15 @@ export default function LoansPage() {
 }, [user, firestore, loans, toast]);
 
 
-  const handleAddNew = useCallback(() => {
+  const handleAddNew = () => {
     setEditingLoan(null);
     setIsFormOpen(true);
-  }, []);
+  };
   
-  const handleCancel = useCallback(() => {
+  const handleCancel = () => {
     setIsFormOpen(false);
     setEditingLoan(null);
-  }, []);
+  };
 
   
   const isLoading = isUserLoading || isDashboardLoading;
