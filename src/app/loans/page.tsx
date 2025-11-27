@@ -1,335 +1,325 @@
-"use client";
-import React, { useEffect, useCallback } from 'react';
-import { z } from 'zod';
-import { useForm } from 'react-hook-form';
-import { zodResolver } from '@hookform/resolvers/zod';
+'use client';
+
+import React, { useCallback, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-  FormDescription,
-} from '@/components/ui/form';
-import { Input, CurrencyInput } from '@/components/ui/input';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
-import { Card, CardContent, CardHeader, CardTitle, CardFooter } from '@/components/ui/card';
-import type { Loan, BankAccount, Payee, OwnerId } from '@/lib/types';
-import { JalaliDatePicker } from '@/components/ui/jalali-calendar';
-import { cn, formatCurrency } from '@/lib/utils';
-import { Switch } from '../ui/switch';
-import { USER_DETAILS } from '@/lib/constants';
+import { PlusCircle } from 'lucide-react';
+import { useUser, useFirestore } from '@/firebase';
+import { collection, doc, runTransaction, addDoc, serverTimestamp, query, where, getDocs, writeBatch, updateDoc } from 'firebase/firestore';
+import type { Loan, LoanPayment, BankAccount, Category, Payee, OwnerId } from '@/lib/types';
+import { Skeleton } from '@/components/ui/skeleton';
+import { useToast } from '@/hooks/use-toast';
+import { LoanList } from '@/components/loans/loan-list';
+import { LoanForm } from '@/components/loans/loan-form';
+import { LoanPaymentDialog } from '@/components/loans/loan-payment-dialog';
+import { useDashboardData } from '@/hooks/use-dashboard-data';
+import { formatCurrency } from '@/lib/utils';
+import { FirestorePermissionError } from '@/firebase/errors';
+import { errorEmitter } from '@/firebase/error-emitter';
 
-const formSchema = z.object({
-  title: z.string().min(2, { message: 'عنوان وام باید حداقل ۲ حرف داشته باشد.' }),
-  payeeId: z.string().optional(),
-  amount: z.coerce.number().positive({ message: 'مبلغ وام باید یک عدد مثبت باشد.' }),
-  ownerId: z.enum(['ali', 'fatemeh', 'shared']).optional(),
-  installmentAmount: z.coerce.number().min(0, 'مبلغ قسط نمی‌تواند منفی باشد.').optional(),
-  numberOfInstallments: z.coerce.number().int().min(0, 'تعداد اقساط نمی‌تواند منفی باشد.').optional(),
-  startDate: z.date({ required_error: 'لطفا تاریخ شروع را انتخاب کنید.' }),
-  paymentDay: z.coerce.number().min(1).max(30, 'روز پرداخت باید بین ۱ تا ۳۰').optional(),
-  depositOnCreate: z.boolean().default(false),
-  depositToAccountId: z.string().optional(),
-}).refine(data => {
-    if (!data.depositOnCreate) {
-      return !!data.ownerId;
-    }
-    return true;
-}, {
-    message: "لطفا مشخص کنید این بدهی برای کیست.",
-    path: ["ownerId"],
-});
+const FAMILY_DATA_DOC = 'shared-data';
 
-type LoanFormValues = z.infer<typeof formSchema>;
+export default function LoansPage() {
+  const { user, isUserLoading } = useUser();
+  const firestore = useFirestore();
+  const { toast } = useToast();
+  const { isLoading: isDashboardLoading, allData } = useDashboardData();
 
-interface LoanFormProps {
-  onCancel: () => void;
-  onSubmit: (data: any) => void;
-  initialData: Loan | null;
-  bankAccounts: BankAccount[];
-  payees: Payee[];
-}
 
-const getOwnerName = (account: BankAccount) => {
-    if (account.ownerId === 'shared') return "(مشترک)";
-    const userDetail = USER_DETAILS[account.ownerId as 'ali' | 'fatemeh'];
-    return userDetail ? `(${userDetail.firstName})` : "(ناشناس)";
-};
+  const [isFormOpen, setIsFormOpen] = useState(false);
+  const [editingLoan, setEditingLoan] = useState<Loan | null>(null);
+  const [payingLoan, setPayingLoan] = useState<Loan | null>(null);
 
-export function LoanForm({ onCancel, onSubmit, initialData, bankAccounts, payees }: LoanFormProps) {
-    const form = useForm<LoanFormValues>({
-        resolver: zodResolver(formSchema),
-        defaultValues: {
-            title: '',
-            payeeId: '',
-            amount: 0,
-            ownerId: 'shared',
-            installmentAmount: 0,
-            numberOfInstallments: 1,
-            startDate: new Date(),
-            paymentDay: 1,
-            depositOnCreate: false,
-            depositToAccountId: '',
-        },
-    });
+  const { 
+    loans,
+    bankAccounts,
+    categories,
+    payees,
+  } = allData;
 
-    const watchDepositOnCreate = form.watch('depositOnCreate');
-    const watchDepositToAccountId = form.watch('depositToAccountId');
-    
-    useEffect(() => {
-        if (initialData) {
-            form.reset({
-                ...initialData,
-                startDate: new Date(initialData.startDate),
-                payeeId: initialData.payeeId || '',
-                installmentAmount: initialData.installmentAmount || 0,
-                numberOfInstallments: initialData.numberOfInstallments || 0,
-                paymentDay: initialData.paymentDay || 1,
-                depositOnCreate: !!initialData.depositToAccountId,
-                depositToAccountId: initialData.depositToAccountId || '',
+  const handleFormSubmit = useCallback(async (values: any) => {
+    if (!user || !firestore) return;
+
+    const {
+        title,
+        amount,
+        installmentAmount,
+        numberOfInstallments,
+        startDate,
+        paymentDay,
+        payeeId,
+        ownerId,
+        depositOnCreate,
+        depositToAccountId,
+    } = values;
+
+    try {
+        await runTransaction(firestore, async (transaction) => {
+            const familyDataRef = doc(firestore, 'family-data', FAMILY_DATA_DOC);
+            
+            let bankAccountDoc = null;
+            let bankAccountData: BankAccount | null = null;
+            let finalOwnerId: OwnerId = ownerId;
+
+            if (depositOnCreate && depositToAccountId) {
+                const bankAccountRef = doc(familyDataRef, 'bankAccounts', depositToAccountId);
+                bankAccountDoc = await transaction.get(bankAccountRef);
+
+                if (!bankAccountDoc.exists()) {
+                    throw new Error('حساب بانکی انتخاب شده برای واریز یافت نشد.');
+                }
+                bankAccountData = bankAccountDoc.data() as BankAccount;
+                finalOwnerId = bankAccountData.ownerId; // Override ownerId based on deposit account
+            }
+
+            const loanData: Omit<Loan, 'id' | 'registeredByUserId' | 'paidInstallments' | 'remainingAmount' > = {
+                title,
+                amount,
+                ownerId: finalOwnerId,
+                installmentAmount: installmentAmount || 0,
+                numberOfInstallments: numberOfInstallments || 0,
+                startDate: startDate,
+                paymentDay: paymentDay || 1,
+                payeeId: payeeId || undefined,
+                depositToAccountId: (depositOnCreate && depositToAccountId) ? depositToAccountId : undefined,
+            };
+
+            const newLoanRef = doc(collection(familyDataRef, 'loans'));
+            transaction.set(newLoanRef, {
+                ...loanData,
+                id: newLoanRef.id,
+                registeredByUserId: user.uid,
+                paidInstallments: 0,
+                remainingAmount: loanData.amount,
             });
+
+            if (depositOnCreate && depositToAccountId && bankAccountDoc && bankAccountData) {
+                const bankAccountRef = bankAccountDoc.ref;
+                const balanceAfter = bankAccountData.balance + loanData.amount;
+                transaction.update(bankAccountRef, { balance: balanceAfter });
+            }
+        });
+
+        toast({ title: 'موفقیت', description: 'وام جدید با موفقیت ثبت شد.' });
+        setIsFormOpen(false);
+        setEditingLoan(null);
+
+    } catch (error: any) {
+        if (error.name === 'FirebaseError') {
+             const permissionError = new FirestorePermissionError({
+                path: 'family-data/shared-data/loans',
+                operation: 'create',
+                requestResourceData: values,
+            });
+            errorEmitter.emit('permission-error', permissionError);
         } else {
-            form.reset({
-                title: '',
-                payeeId: '',
-                amount: 0,
-                ownerId: 'shared',
-                installmentAmount: 0,
-                numberOfInstallments: 1,
-                startDate: new Date(),
-                paymentDay: 1,
-                depositOnCreate: false,
-                depositToAccountId: '',
+            toast({
+                variant: 'destructive',
+                title: 'خطا در ثبت وام',
+                description: error.message || 'مشکلی در ثبت اطلاعات پیش آمد.',
             });
         }
-    }, [initialData, form]);
+    }
+}, [user, firestore, editingLoan, toast]);
+
+
+  const handlePayInstallment = useCallback(async ({ loan, paymentBankAccountId, installmentAmount }: { loan: Loan, paymentBankAccountId: string, installmentAmount: number }) => {
+    if (!user || !firestore || !bankAccounts || !categories) return;
+
+    if (installmentAmount <= 0) {
+        toast({ variant: "destructive", title: "خطا", description: "مبلغ قسط باید بیشتر از صفر باشد."});
+        return;
+    }
+
+    try {
+        await runTransaction(firestore, async (transaction) => {
+            const familyDataRef = doc(firestore, 'family-data', FAMILY_DATA_DOC);
+            const loanRef = doc(familyDataRef, 'loans', loan.id);
+            const accountToPayFromRef = doc(familyDataRef, 'bankAccounts', paymentBankAccountId);
+            
+            const loanDoc = await transaction.get(loanRef);
+            const accountToPayFromDoc = await transaction.get(accountToPayFromRef);
+
+            if (!loanDoc.exists()) throw new Error("وام مورد نظر یافت نشد.");
+            if (!accountToPayFromDoc.exists()) throw new Error("کارت بانکی پرداخت یافت نشد.");
+            
+            const currentLoanData = loanDoc.data()!;
+            const accountData = accountToPayFromDoc.data() as BankAccount;
+            const availableBalance = accountData.balance - (accountData.blockedBalance || 0);
+
+            if (installmentAmount > currentLoanData.remainingAmount) {
+                throw new Error(`مبلغ پرداختی (${formatCurrency(installmentAmount, 'IRT')}) نمی‌تواند از مبلغ باقی‌مانده وام (${formatCurrency(currentLoanData.remainingAmount, 'IRT')}) بیشتر باشد.`);
+            }
+
+            if (availableBalance < installmentAmount) {
+                throw new Error("موجودی حساب برای پرداخت قسط کافی نیست.");
+            }
+
+            const balanceBefore = accountData.balance;
+            const balanceAfter = balanceBefore - installmentAmount;
+            const newPaidInstallments = currentLoanData.paidInstallments + 1;
+            const newRemainingAmount = currentLoanData.remainingAmount - installmentAmount;
+
+            transaction.update(accountToPayFromRef, { balance: balanceAfter });
+
+            transaction.update(loanRef, {
+                paidInstallments: newPaidInstallments,
+                remainingAmount: newRemainingAmount,
+            });
+
+            const paymentRef = doc(collection(familyDataRef, 'loanPayments'));
+            transaction.set(paymentRef, {
+                id: paymentRef.id,
+                loanId: loan.id,
+                bankAccountId: paymentBankAccountId,
+                amount: installmentAmount,
+                paymentDate: new Date().toISOString(),
+                registeredByUserId: user.uid,
+            });
+
+            const expenseRef = doc(collection(familyDataRef, 'expenses'));
+            const expenseCategory = categories?.find(c => c.name.includes('قسط')) || categories?.[0];
+            transaction.set(expenseRef, {
+                id: expenseRef.id,
+                ownerId: accountData.ownerId,
+                registeredByUserId: user.uid,
+                amount: installmentAmount,
+                bankAccountId: paymentBankAccountId,
+                categoryId: expenseCategory?.id || 'uncategorized',
+                date: new Date().toISOString(),
+                description: `پرداخت قسط وام: ${loan.title}`,
+                type: 'expense',
+                loanPaymentId: paymentRef.id,
+                createdAt: serverTimestamp(),
+                balanceBefore: balanceBefore,
+                balanceAfter: balanceAfter,
+            });
+        });
+        toast({ title: "موفقیت", description: "قسط با موفقیت پرداخت و به عنوان هزینه ثبت شد." });
+        setPayingLoan(null);
+    } catch (error: any) {
+        toast({
+            variant: "destructive",
+            title: "خطا در پرداخت قسط",
+            description: error.message,
+        });
+    }
+  }, [user, firestore, bankAccounts, categories, toast]);
+
+  const handleDelete = useCallback(async (loanId: string) => {
+    if (!user || !firestore || !loans) return;
+
+    const loanToDelete = loans.find(l => l.id === loanId);
+    if (!loanToDelete) {
+        toast({ variant: 'destructive', title: 'خطا', description: 'وام مورد نظر یافت نشد.' });
+        return;
+    }
     
-    const depositAccount = bankAccounts.find(acc => acc.id === watchDepositToAccountId);
+    if (loanToDelete.paidInstallments > 0) {
+        toast({ variant: 'destructive', title: 'امکان حذف وجود ندارد', description: 'این وام دارای سابقه پرداخت است. برای حذف، ابتدا باید تمام پرداخت‌ها را به صورت دستی برگردانید و سپس وام را حذف کنید.' });
+        return;
+    }
 
-    const handleFormSubmit = useCallback((data: LoanFormValues) => {
-        const submissionData = {
-            ...data,
-            startDate: data.startDate.toISOString(),
-            payeeId: data.payeeId,
-            ownerId: data.ownerId
-        };
-        onSubmit(submissionData);
-    }, [onSubmit]);
+    try {
+        await runTransaction(firestore, async (transaction) => {
+            const familyDataRef = doc(firestore, 'family-data', FAMILY_DATA_DOC);
+            const loanRef = doc(familyDataRef, 'loans', loanId);
 
-    return (
-        <Card>
-        <CardHeader>
-            <CardTitle className="font-headline">
-            {initialData ? 'ویرایش وام' : 'ثبت وام جدید'}
-            </CardTitle>
-        </CardHeader>
-        <Form {...form}>
-            <form onSubmit={form.handleSubmit(handleFormSubmit)}>
-            <CardContent className="space-y-6">
-                <FormField
-                control={form.control}
-                name="title"
-                render={({ field }) => (
-                    <FormItem>
-                    <FormLabel>عنوان وام</FormLabel>
-                    <FormControl>
-                        <Input placeholder="مثال: وام خرید مسکن" {...field} />
-                    </FormControl>
-                    <FormMessage />
-                    </FormItem>
-                )}
+            // Reverse the initial deposit if it was made
+            if (loanToDelete.depositToAccountId) {
+                const depositAccountRef = doc(familyDataRef, 'bankAccounts', loanToDelete.depositToAccountId);
+                const depositAccountDoc = await transaction.get(depositAccountRef);
+                if (depositAccountDoc.exists()) {
+                    const accountData = depositAccountDoc.data() as BankAccount;
+                    transaction.update(depositAccountRef, { balance: accountData.balance - loanToDelete.amount });
+                } else {
+                    console.warn(`Cannot reverse loan deposit: Account ${loanToDelete.depositToAccountId} not found. The deletion will proceed without reversing the initial deposit.`);
+                }
+            }
+            
+            transaction.delete(loanRef);
+        });
+
+        toast({ title: "موفقیت", description: "وام با موفقیت حذف شد." });
+
+    } catch (error: any) {
+        if (error.name === 'FirebaseError') {
+             const permissionError = new FirestorePermissionError({
+                path: `family-data/shared-data/loans/${loanId}`,
+                operation: 'delete'
+            });
+            errorEmitter.emit('permission-error', permissionError);
+        } else {
+            toast({
+                variant: "destructive",
+                title: "خطا در حذف وام",
+                description: error.message || "مشکلی در حذف وام پیش آمد.",
+            });
+        }
+    }
+}, [user, firestore, loans, toast]);
+
+
+  const handleAddNew = () => {
+    setEditingLoan(null);
+    setIsFormOpen(true);
+  };
+  
+  const handleCancel = () => {
+    setIsFormOpen(false);
+    setEditingLoan(null);
+  };
+
+  
+  const isLoading = isUserLoading || isDashboardLoading;
+  
+  return (
+    <main className="flex-1 space-y-4 p-4 pt-6 md:p-8">
+      <div className="flex items-center justify-between">
+        <h1 className="font-headline text-3xl font-bold tracking-tight">مدیریت وام‌ها</h1>
+        {!isFormOpen && (
+            <Button onClick={handleAddNew}>
+                <PlusCircle className="ml-2 h-4 w-4" />
+                ثبت وام جدید
+            </Button>
+        )}
+      </div>
+      
+      {isLoading ? (
+        <div className="space-y-4">
+            <Skeleton className="h-10 w-full" />
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <Skeleton className="h-48 w-full rounded-xl" />
+                <Skeleton className="h-48 w-full rounded-xl" />
+            </div>
+        </div>
+      ) : isFormOpen ? (
+        <LoanForm
+            onCancel={handleCancel}
+            onSubmit={handleFormSubmit}
+            initialData={editingLoan}
+            bankAccounts={bankAccounts || []}
+            payees={payees || []}
+        />
+      ) : (
+        <>
+            <LoanList
+                loans={loans || []}
+                payees={payees || []}
+                bankAccounts={bankAccounts || []}
+                onDelete={handleDelete}
+                onPay={setPayingLoan}
+            />
+            {payingLoan && (
+                <LoanPaymentDialog
+                    loan={payingLoan}
+                    bankAccounts={bankAccounts || []}
+                    isOpen={!!payingLoan}
+                    onOpenChange={() => setPayingLoan(null)}
+                    onSubmit={handlePayInstallment}
                 />
-                <FormField
-                    control={form.control}
-                    name="amount"
-                    render={({ field }) => (
-                    <FormItem>
-                        <FormLabel>مبلغ کل وام (تومان)</FormLabel>
-                        <FormControl>
-                        <CurrencyInput value={field.value} onChange={field.onChange} />
-                        </FormControl>
-                        <FormMessage />
-                    </FormItem>
-                    )}
-                />
-                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                <FormField
-                    control={form.control}
-                    name="payeeId"
-                    render={({ field }) => (
-                        <FormItem>
-                        <FormLabel>دریافت وام از (طرف حساب)</FormLabel>
-                        <Select onValueChange={field.onChange} value={field.value}>
-                            <FormControl>
-                            <SelectTrigger>
-                                <SelectValue placeholder="یک طرف حساب انتخاب کنید (اختیاری)" />
-                            </SelectTrigger>
-                            </FormControl>
-                            <SelectContent>
-                            {payees.map((payee) => (
-                                <SelectItem key={payee.id} value={payee.id}>{payee.name}</SelectItem>
-                            ))}
-                            </SelectContent>
-                        </Select>
-                        <FormMessage />
-                        </FormItem>
-                    )}
-                    />
-                    {!watchDepositOnCreate && (
-                        <FormField
-                            control={form.control}
-                            name="ownerId"
-                            render={({ field }) => (
-                            <FormItem>
-                                <FormLabel>این بدهی برای کیست؟</FormLabel>
-                                <Select onValueChange={field.onChange} value={field.value}>
-                                <FormControl>
-                                    <SelectTrigger>
-                                    <SelectValue placeholder="شخص مورد نظر را انتخاب کنید" />
-                                    </SelectTrigger>
-                                </FormControl>
-                                <SelectContent>
-                                    <SelectItem value="ali">{USER_DETAILS.ali.firstName}</SelectItem>
-                                    <SelectItem value="fatemeh">{USER_DETAILS.fatemeh.firstName}</SelectItem>
-                                    <SelectItem value="shared">مشترک</SelectItem>
-                                </SelectContent>
-                                </Select>
-                                <FormMessage />
-                            </FormItem>
-                            )}
-                        />
-                    )}
-                </div>
-                <div className="rounded-lg border p-4 space-y-4">
-                    <p className='text-sm text-muted-foreground'>اطلاعات زیر فقط برای یادآوری و آمار است و در محاسبات تاثیری ندارد.</p>
-                    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                        <FormField
-                            control={form.control}
-                            name="installmentAmount"
-                            render={({ field }) => (
-                            <FormItem>
-                                <FormLabel>مبلغ پیشنهادی هر قسط (تومان)</FormLabel>
-                                <FormControl>
-                                <CurrencyInput value={field.value || 0} onChange={field.onChange} />
-                                </FormControl>
-                                <FormMessage />
-                            </FormItem>
-                            )}
-                        />
-                        <FormField
-                            control={form.control}
-                            name="numberOfInstallments"
-                            render={({ field }) => (
-                            <FormItem>
-                                <FormLabel>تعداد پیشنهادی اقساط</FormLabel>
-                                <FormControl>
-                                <Input type="number" {...field} value={field.value || 0} />
-                                </FormControl>
-                                <FormMessage />
-                            </FormItem>
-                            )}
-                        />
-                    </div>
-                </div>
-                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                    <FormField
-                        control={form.control}
-                        name="paymentDay"
-                        render={({ field }) => (
-                        <FormItem>
-                            <FormLabel>روز یادآوری پرداخت در ماه</FormLabel>
-                            <FormControl>
-                            <Input type="number" min="1" max="30" {...field} value={field.value || 1} />
-                            </FormControl>
-                            <FormDescription>
-                            روز پرداخت قسط در هر ماه (مثلا: پنجم هر ماه)
-                            </FormDescription>
-                            <FormMessage />
-                        </FormItem>
-                        )}
-                    />
-                    <FormField
-                        control={form.control}
-                        name="startDate"
-                        render={({ field }) => (
-                        <FormItem className="flex flex-col">
-                            <FormLabel>تاریخ دریافت وام</FormLabel>
-                            <JalaliDatePicker value={field.value} onChange={field.onChange} />
-                            <FormMessage />
-                        </FormItem>
-                        )}
-                    />
-                </div>
-                {!initialData && (
-                    <div className="space-y-4 rounded-lg border p-4">
-                        <FormField
-                            control={form.control}
-                            name="depositOnCreate"
-                            render={({ field }) => (
-                            <FormItem className="flex flex-row items-center justify-between">
-                                <div className="space-y-0.5">
-                                <FormLabel>واریز مبلغ وام به حساب</FormLabel>
-                                <FormDescription>
-                                آیا مایلید مبلغ کل وام به موجودی یکی از حساب‌ها اضافه شود؟
-                                </FormDescription>
-                                </div>
-                                <FormControl>
-                                <Switch
-                                    checked={field.value}
-                                    onCheckedChange={field.onChange}
-                                />
-                                </FormControl>
-                            </FormItem>
-                            )}
-                        />
-                        {watchDepositOnCreate && (
-                            <FormField
-                                control={form.control}
-                                name="depositToAccountId"
-                                render={({ field }) => (
-                                <FormItem>
-                                    <FormLabel>واریز به کارت</FormLabel>
-                                    <Select onValueChange={field.onChange} value={field.value}>
-                                    <FormControl>
-                                        <SelectTrigger>
-                                        <SelectValue placeholder="یک کارت برای واریز انتخاب کنید" />
-                                        </SelectTrigger>
-                                    </FormControl>
-                                    <SelectContent>
-                                        {bankAccounts.map((account) => (
-                                        <SelectItem key={account.id} value={account.id}>
-                                            {`${account.bankName} ${getOwnerName(account)}`}
-                                        </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                    {depositAccount && (
-                                        <FormDescription className="pt-2">
-                                            موجودی فعلی این حساب: {formatCurrency(depositAccount.balance, 'IRT')}
-                                        </FormDescription>
-                                    )}
-                                    <FormMessage />
-                                </FormItem>
-                                )}
-                            />
-                        )}
-                    </div>
-                )}
-            </CardContent>
-            <CardFooter className="flex justify-end gap-2">
-                <Button type="button" variant="outline" onClick={onCancel}>لغو</Button>
-                <Button type="submit">ذخیره</Button>
-            </CardFooter>
-            </form>
-        </Form>
-        </Card>
-    );
+            )}
+        </>
+      )}
+    </main>
+  );
 }
